@@ -27,6 +27,11 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -37,6 +42,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
+    # Logging.
+    wandb_project = os.environ.get("WANDB_PROJECT", "parameter-golf")
+    wandb_enabled = bool(int(os.environ.get("WANDB_ENABLED", "1" if wandb is not None else "0")))
+
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -1041,6 +1050,18 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
 
+    # W&B logging (only on rank 0).
+    if master_process and args.wandb_enabled and wandb is not None:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.run_id,
+            config={k: v for k, v in vars(type(args)).items() if not k.startswith("_") and not callable(v)},
+        )
+
+    def wandb_log(data: dict, step: int | None = None) -> None:
+        if master_process and args.wandb_enabled and wandb is not None and wandb.run is not None:
+            wandb.log(data, step=step)
+
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -1125,6 +1146,7 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            wandb_log({"val_loss": val_loss, "val_bpb": val_bpb}, step=step)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1176,6 +1198,7 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+        wandb_log({"train_loss": train_loss.item(), "lr_scale": scale}, step=step)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1253,6 +1276,9 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    wandb_log({"final_val_loss": q_val_loss, "final_val_bpb": q_val_bpb, "artifact_bytes": quant_file_bytes if master_process else 0})
+    if master_process and args.wandb_enabled and wandb is not None and wandb.run is not None:
+        wandb.finish()
 
     if distributed:
         dist.destroy_process_group()
