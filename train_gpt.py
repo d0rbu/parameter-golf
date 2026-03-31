@@ -81,6 +81,14 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+
+    # Seed coefficient optimization.
+    seed_num_bases = int(os.environ.get("SEED_NUM_BASES", 0))  # k; 0 = disabled
+    seed_anchor_ratio = os.environ.get("SEED_ANCHOR_RATIO", "5:1")  # seed:anchor
+    seed_coeff_lr = float(os.environ.get("SEED_COEFF_LR", 0.04))
+    seed_master_seed = int(os.environ.get("SEED_MASTER_SEED", 42))
+    seed_force_anchor = os.environ.get("SEED_FORCE_ANCHOR", "0,-1")  # layer indices forced to anchor
+
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -513,6 +521,78 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+class SeedLinear(nn.Module):
+    """Linear layer whose weight is a learned linear combination of deterministic random matrices.
+
+    Only the scalar coefficients are trained. The random basis matrices are regenerated
+    from seeds at load time, so only coeffs + master_seed are stored in the artifact.
+    """
+
+    def __init__(self, in_features: int, out_features: int, num_bases: int,
+                 bias: bool = False, zero_init: bool = False, seeds: Tensor | None = None):
+        super().__init__()
+        if bias:
+            raise ValueError("SeedLinear does not support bias")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_bases = num_bases
+        # Learnable coefficients -- the ONLY trained parameters (kept in float32).
+        self.coeffs = nn.Parameter(torch.zeros(num_bases, dtype=torch.float32))
+        # Fixed seeds for each basis (persistent so they survive state_dict roundtrip).
+        if seeds is None:
+            seeds = torch.arange(num_bases, dtype=torch.int64)
+        self.register_buffer("seeds", seeds, persistent=True)
+        # Basis matrices are regenerated from seeds -- NOT saved.
+        self.register_buffer("basis", self._generate_basis(), persistent=False)
+        self._init_coeffs(zero_init)
+
+    def _generate_basis(self) -> Tensor:
+        sigma = 1.0 / math.sqrt(self.in_features * self.num_bases)
+        bases = []
+        for i in range(self.num_bases):
+            gen = torch.Generator()
+            gen.manual_seed(int(self.seeds[i].item()))
+            bases.append(torch.randn(self.out_features, self.in_features, generator=gen) * sigma)
+        return torch.stack(bases)  # (k, out, in)
+
+    def _init_coeffs(self, zero_init: bool) -> None:
+        if zero_init:
+            nn.init.zeros_(self.coeffs)
+        else:
+            nn.init.ones_(self.coeffs)
+
+    def regenerate_basis(self) -> None:
+        """Rebuild basis matrices from seeds (call after load_state_dict)."""
+        self.basis = self._generate_basis().to(self.coeffs.device)
+
+    def forward(self, x: Tensor) -> Tensor:
+        W = torch.einsum("k,koi->oi", self.coeffs.to(x.dtype), self.basis.to(x.dtype))
+        return F.linear(x, W)
+
+
+def derive_seed_schedule(master_seed: int, count: int) -> list[int]:
+    """Derive `count` deterministic seeds from a single master seed."""
+    gen = torch.Generator()
+    gen.manual_seed(master_seed)
+    return [int(torch.randint(0, 2**62, (1,), generator=gen).item()) for _ in range(count)]
+
+
+def get_layer_types(num_layers: int, ratio_str: str, force_anchor_str: str) -> list[str]:
+    """Return 'seed' or 'anchor' for each layer index."""
+    parts = ratio_str.split(":")
+    n_seed, n_anchor = int(parts[0]), int(parts[1])
+    cycle = n_seed + n_anchor
+    types = ["seed" if (i % cycle) < n_seed else "anchor" for i in range(num_layers)]
+    if force_anchor_str.strip():
+        for idx_str in force_anchor_str.split(","):
+            idx = int(idx_str.strip())
+            if idx < 0:
+                idx = num_layers + idx
+            if 0 <= idx < num_layers:
+                types[idx] = "anchor"
+    return types
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -560,6 +640,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        linear_factory=None,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -572,11 +653,13 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
+        make = linear_factory or (lambda in_f, out_f, **kw: CastedLinear(in_f, out_f, bias=False))
+        self.c_q = make(dim, dim)
+        self.c_k = make(dim, kv_dim)
+        self.c_v = make(dim, kv_dim)
+        self.proj = make(dim, dim, zero_init=True)
+        if isinstance(self.proj, CastedLinear):
+            self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
@@ -605,12 +688,14 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, linear_factory=None):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        make = linear_factory or (lambda in_f, out_f, **kw: CastedLinear(in_f, out_f, bias=False))
+        self.fc = make(dim, hidden)
+        self.proj = make(hidden, dim, zero_init=True)
+        if isinstance(self.proj, CastedLinear):
+            self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
@@ -626,12 +711,13 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        linear_factory=None,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, linear_factory=linear_factory)
+        self.mlp = MLP(dim, mlp_mult, linear_factory=linear_factory)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -659,6 +745,10 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        seed_num_bases: int = 0,
+        seed_anchor_ratio: str = "5:1",
+        seed_master_seed: int = 42,
+        seed_force_anchor: str = "0,-1",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,24 +756,48 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.seed_num_bases = seed_num_bases
+        self.seed_master_seed = seed_master_seed
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for i in range(num_layers)
-            ]
-        )
+
+        # Determine which layers are seed vs anchor.
+        if seed_num_bases > 0:
+            layer_types = get_layer_types(num_layers, seed_anchor_ratio, seed_force_anchor)
+            # 6 weight matrices per block: c_q, c_k, c_v, proj, fc, mlp_proj
+            total_seed_matrices = sum(6 for lt in layer_types if lt == "seed")
+            all_seeds = derive_seed_schedule(seed_master_seed, total_seed_matrices * seed_num_bases)
+        else:
+            layer_types = ["anchor"] * num_layers
+            all_seeds = []
+
+        self._layer_types = layer_types
+        seed_offset = 0
+        blocks = []
+        for i in range(num_layers):
+            if layer_types[i] == "seed":
+                # Build a factory that creates SeedLinear with the right chunk of seeds.
+                layer_seeds = all_seeds[seed_offset : seed_offset + 6 * seed_num_bases]
+                seed_offset += 6 * seed_num_bases
+                _matrix_idx = [0]  # mutable counter for the closure
+
+                def make_seed_linear(in_f, out_f, zero_init=False, _seeds=layer_seeds, _k=seed_num_bases, _ctr=_matrix_idx):
+                    start = _ctr[0] * _k
+                    seeds_t = torch.tensor(_seeds[start : start + _k], dtype=torch.int64)
+                    _ctr[0] += 1
+                    return SeedLinear(in_f, out_f, _k, zero_init=zero_init, seeds=seeds_t)
+
+                factory = make_seed_linear
+            else:
+                factory = None
+            blocks.append(
+                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, linear_factory=factory)
+            )
+        self.blocks = nn.ModuleList(blocks)
+
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -835,6 +949,10 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        seed_num_bases=args.seed_num_bases,
+        seed_anchor_ratio=args.seed_anchor_ratio,
+        seed_master_seed=args.seed_master_seed,
+        seed_force_anchor=args.seed_force_anchor,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -849,16 +967,16 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    matrix_params = []
+    scalar_params = []
+    seed_coeff_params = []
+    for name, p in block_named_params:
+        if "coeffs" in name:
+            seed_coeff_params.append(p)
+        elif p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+            matrix_params.append(p)
+        else:
+            scalar_params.append(p)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -883,6 +1001,14 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if seed_coeff_params:
+        optimizer_seed = torch.optim.Adam(
+            [{"params": seed_coeff_params, "lr": args.seed_coeff_lr, "base_lr": args.seed_coeff_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_seed)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -894,6 +1020,12 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    if args.seed_num_bases > 0:
+        n_seed = sum(1 for lt in base_model._layer_types if lt == "seed")
+        n_anchor = sum(1 for lt in base_model._layer_types if lt == "anchor")
+        n_coeff = sum(p.numel() for p in seed_coeff_params)
+        log0(f"seed_layers:{n_seed} anchor_layers:{n_anchor} k:{args.seed_num_bases} coeff_params:{n_coeff} master_seed:{args.seed_master_seed}")
+        log0(f"layer_types:{base_model._layer_types}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1097,6 +1229,10 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    # Regenerate SeedLinear basis matrices from loaded seeds.
+    for module in base_model.modules():
+        if isinstance(module, SeedLinear):
+            module.regenerate_basis()
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
