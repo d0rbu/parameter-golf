@@ -537,6 +537,37 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+class _CachedSeedForward(torch.autograd.Function):
+    """Custom autograd for SeedLinear with cached weight matrix.
+
+    Forward: uses pre-computed cached_W (skips einsum), saving bandwidth.
+    Backward: computes dL/d_coeffs from basis and grad_W.
+    Uses setup_context for torch.compile compatibility.
+    """
+
+    @staticmethod
+    def forward(x: Tensor, coeffs: Tensor, basis: Tensor, cached_W: Tensor) -> Tensor:
+        return F.linear(x, cached_W)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        x, coeffs, basis, cached_W = inputs
+        ctx.save_for_backward(x, cached_W, basis)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        x, cached_W, basis = ctx.saved_tensors
+        # dL/dx = grad_output @ W
+        grad_x = grad_output @ cached_W
+        # dL/dW = grad_output^T @ x (flattened to 2D)
+        x_2d = x.reshape(-1, x.shape[-1])
+        go_2d = grad_output.reshape(-1, grad_output.shape[-1])
+        grad_W = go_2d.t() @ x_2d
+        # dL/d_coeffs[k] = sum_{o,i} dL/dW[o,i] * basis[k,o,i]
+        grad_coeffs = torch.einsum("oi,koi->k", grad_W, basis.to(grad_W.dtype))
+        return grad_x, grad_coeffs, None, None
+
+
 class SeedLinear(nn.Module):
     """Linear layer whose weight is a learned linear combination of deterministic random matrices.
 
@@ -561,6 +592,8 @@ class SeedLinear(nn.Module):
         # Basis matrices are regenerated from seeds -- NOT saved.
         self.register_buffer("basis", self._generate_basis(), persistent=False)
         self._init_coeffs(zero_init)
+        # Cached materialized weight (non-persistent, recomputed after optimizer step).
+        self.register_buffer("_cached_W", None, persistent=False)
 
     def _generate_basis(self) -> Tensor:
         sigma = 1.0 / math.sqrt(self.in_features * self.num_bases)
@@ -580,8 +613,26 @@ class SeedLinear(nn.Module):
     def regenerate_basis(self) -> None:
         """Rebuild basis matrices from seeds (call after load_state_dict)."""
         self.basis = self._generate_basis().to(self.coeffs.device)
+        self.cache_weight()
+
+    def cache_weight(self) -> None:
+        """Recompute W = einsum(coeffs, basis) and store for cached forward passes."""
+        with torch.no_grad():
+            W = torch.einsum(
+                "k,koi->oi",
+                self.coeffs.to(torch.bfloat16),
+                self.basis.to(torch.bfloat16),
+            )
+        if self._cached_W is not None and self._cached_W.shape == W.shape:
+            self._cached_W.copy_(W)
+        else:
+            self._cached_W = W
 
     def forward(self, x: Tensor) -> Tensor:
+        if self._cached_W is not None:
+            return _CachedSeedForward.apply(
+                x, self.coeffs.to(x.dtype), self.basis, self._cached_W.to(x.dtype),
+            )
         W = torch.einsum("k,koi->oi", self.coeffs.to(x.dtype), self.basis.to(x.dtype))
         return F.linear(x, W)
 
