@@ -65,6 +65,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    grad_accum_override = int(os.environ.get("GRAD_ACCUM_STEPS", 0))  # 0 = use default (8 // world_size)
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -93,10 +94,15 @@ class Hyperparameters:
 
     # Seed coefficient optimization.
     seed_num_bases = int(os.environ.get("SEED_NUM_BASES", 0))  # k; 0 = disabled
-    seed_anchor_ratio = os.environ.get("SEED_ANCHOR_RATIO", "5:1")  # seed:anchor
+    seed_anchor_ratio = os.environ.get("SEED_ANCHOR_RATIO", "5:1")  # seed:anchor (legacy)
     seed_coeff_lr = float(os.environ.get("SEED_COEFF_LR", 0.04))
     seed_master_seed = int(os.environ.get("SEED_MASTER_SEED", 42))
-    seed_force_anchor = os.environ.get("SEED_FORCE_ANCHOR", "0,-1")  # layer indices forced to anchor
+
+    # Layer pattern: repeating cycle of d(ense), b(ottleneck), s(eed).
+    # Overrides seed_anchor_ratio when set.  E.g. "d,s,s,s,s" or "d,b,s,s,s,s".
+    layer_pattern = os.environ.get("LAYER_PATTERN", "")
+    bottleneck_rank = int(os.environ.get("BOTTLENECK_RANK", 128))
+    bottleneck_act = os.environ.get("BOTTLENECK_ACT", "relu2")
 
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
@@ -562,7 +568,7 @@ class SeedLinear(nn.Module):
             gen = torch.Generator()
             gen.manual_seed(int(self.seeds[i].item()))
             bases.append(torch.randn(self.out_features, self.in_features, generator=gen) * sigma)
-        return torch.stack(bases)  # (k, out, in)
+        return torch.stack(bases).to(torch.float8_e4m3fn)  # (k, out, in), fp8 to save VRAM
 
     def _init_coeffs(self, zero_init: bool) -> None:
         if zero_init:
@@ -579,6 +585,50 @@ class SeedLinear(nn.Module):
         return F.linear(x, W)
 
 
+class BottleneckLinear(nn.Module):
+    """Low-rank bottleneck linear layer: y = A @ act(B @ x).
+
+    Stores A (out_features, rank) and B (rank, in_features) instead of a full
+    (out_features, in_features) weight matrix.  With rank << min(in, out) this
+    gives large compression while the optional nonlinearity provides more
+    expressivity than a plain low-rank factorization.
+    """
+
+    _ACTIVATIONS = {
+        "relu2": lambda x: torch.relu(x).square(),
+        "relu": torch.relu,
+        "none": lambda x: x,
+    }
+
+    def __init__(self, in_features: int, out_features: int, rank: int,
+                 bias: bool = False, zero_init: bool = False, activation: str = "relu2"):
+        super().__init__()
+        if bias:
+            raise ValueError("BottleneckLinear does not support bias")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.act_fn = self._ACTIVATIONS[activation]
+        # B projects down: (rank, in_features). A projects up: (out_features, rank).
+        # Both are 2D -> will be optimized by Muon.
+        self.B = nn.Parameter(torch.empty(rank, in_features, dtype=torch.float32))
+        self.A = nn.Parameter(torch.empty(out_features, rank, dtype=torch.float32))
+        self._init_weights(zero_init)
+
+    def _init_weights(self, zero_init: bool) -> None:
+        # Kaiming init for B (fan_in = in_features).
+        nn.init.kaiming_normal_(self.B)
+        if zero_init:
+            nn.init.zeros_(self.A)
+        else:
+            nn.init.kaiming_normal_(self.A)
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = F.linear(x, self.B.to(x.dtype))
+        h = self.act_fn(h)
+        return F.linear(h, self.A.to(x.dtype))
+
+
 def derive_seed_schedule(master_seed: int, count: int) -> list[int]:
     """Derive `count` deterministic seeds from a single master seed."""
     gen = torch.Generator()
@@ -586,20 +636,23 @@ def derive_seed_schedule(master_seed: int, count: int) -> list[int]:
     return [int(torch.randint(0, 2**62, (1,), generator=gen).item()) for _ in range(count)]
 
 
-def get_layer_types(num_layers: int, ratio_str: str, force_anchor_str: str) -> list[str]:
-    """Return 'seed' or 'anchor' for each layer index."""
+_LAYER_TYPE_ABBREV = {"d": "dense", "b": "bottleneck", "s": "seed"}
+
+
+def get_layer_types(num_layers: int, ratio_str: str = "", pattern_str: str = "") -> list[str]:
+    """Return a layer type for each layer index.
+
+    If *pattern_str* is given (e.g. ``"d,b,s,s,s"``), it is tiled to fill
+    *num_layers*.  Otherwise *ratio_str* (e.g. ``"5:1"``) is used as a
+    legacy seed:anchor ratio with anchor-first cycling.
+    """
+    if pattern_str:
+        cycle = [_LAYER_TYPE_ABBREV.get(t.strip(), t.strip()) for t in pattern_str.split(",")]
+        return [cycle[i % len(cycle)] for i in range(num_layers)]
     parts = ratio_str.split(":")
     n_seed, n_anchor = int(parts[0]), int(parts[1])
     cycle = n_seed + n_anchor
-    types = ["seed" if (i % cycle) < n_seed else "anchor" for i in range(num_layers)]
-    if force_anchor_str.strip():
-        for idx_str in force_anchor_str.split(","):
-            idx = int(idx_str.strip())
-            if idx < 0:
-                idx = num_layers + idx
-            if 0 <= idx < num_layers:
-                types[idx] = "anchor"
-    return types
+    return ["dense" if (i % cycle) < n_anchor else "seed" for i in range(num_layers)]
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -757,7 +810,9 @@ class GPT(nn.Module):
         seed_num_bases: int = 0,
         seed_anchor_ratio: str = "5:1",
         seed_master_seed: int = 42,
-        seed_force_anchor: str = "0,-1",
+        layer_pattern: str = "",
+        bottleneck_rank: int = 128,
+        bottleneck_act: str = "relu2",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -773,25 +828,24 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
 
-        # Determine which layers are seed vs anchor.
-        if seed_num_bases > 0:
-            layer_types = get_layer_types(num_layers, seed_anchor_ratio, seed_force_anchor)
-            # 6 weight matrices per block: c_q, c_k, c_v, proj, fc, mlp_proj
+        # Determine layer types: dense / bottleneck / seed.
+        if seed_num_bases > 0 or layer_pattern:
+            layer_types = get_layer_types(num_layers, ratio_str=seed_anchor_ratio, pattern_str=layer_pattern)
             total_seed_matrices = sum(6 for lt in layer_types if lt == "seed")
-            all_seeds = derive_seed_schedule(seed_master_seed, total_seed_matrices * seed_num_bases)
+            all_seeds = derive_seed_schedule(seed_master_seed, total_seed_matrices * seed_num_bases) if total_seed_matrices > 0 else []
         else:
-            layer_types = ["anchor"] * num_layers
+            layer_types = ["dense"] * num_layers
             all_seeds = []
 
         self._layer_types = layer_types
         seed_offset = 0
         blocks = []
         for i in range(num_layers):
-            if layer_types[i] == "seed":
-                # Build a factory that creates SeedLinear with the right chunk of seeds.
+            lt = layer_types[i]
+            if lt == "seed":
                 layer_seeds = all_seeds[seed_offset : seed_offset + 6 * seed_num_bases]
                 seed_offset += 6 * seed_num_bases
-                _matrix_idx = [0]  # mutable counter for the closure
+                _matrix_idx = [0]
 
                 def make_seed_linear(in_f, out_f, zero_init=False, _seeds=layer_seeds, _k=seed_num_bases, _ctr=_matrix_idx):
                     start = _ctr[0] * _k
@@ -800,7 +854,14 @@ class GPT(nn.Module):
                     return SeedLinear(in_f, out_f, _k, zero_init=zero_init, seeds=seeds_t)
 
                 factory = make_seed_linear
-            else:
+            elif lt == "bottleneck":
+                _bn_rank, _bn_act = bottleneck_rank, bottleneck_act
+
+                def make_bottleneck_linear(in_f, out_f, zero_init=False, _r=_bn_rank, _a=_bn_act):
+                    return BottleneckLinear(in_f, out_f, _r, zero_init=zero_init, activation=_a)
+
+                factory = make_bottleneck_linear
+            else:  # dense
                 factory = None
             blocks.append(
                 Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, linear_factory=factory)
@@ -870,7 +931,7 @@ def main() -> None:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    grad_accum_steps = args.grad_accum_override if args.grad_accum_override > 0 else 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -961,7 +1022,9 @@ def main() -> None:
         seed_num_bases=args.seed_num_bases,
         seed_anchor_ratio=args.seed_anchor_ratio,
         seed_master_seed=args.seed_master_seed,
-        seed_force_anchor=args.seed_force_anchor,
+        layer_pattern=args.layer_pattern,
+        bottleneck_rank=args.bottleneck_rank,
+        bottleneck_act=args.bottleneck_act,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1029,11 +1092,12 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
-    if args.seed_num_bases > 0:
+    if args.seed_num_bases > 0 or args.layer_pattern:
         n_seed = sum(1 for lt in base_model._layer_types if lt == "seed")
-        n_anchor = sum(1 for lt in base_model._layer_types if lt == "anchor")
+        n_dense = sum(1 for lt in base_model._layer_types if lt == "dense")
+        n_bottleneck = sum(1 for lt in base_model._layer_types if lt == "bottleneck")
         n_coeff = sum(p.numel() for p in seed_coeff_params)
-        log0(f"seed_layers:{n_seed} anchor_layers:{n_anchor} k:{args.seed_num_bases} coeff_params:{n_coeff} master_seed:{args.seed_master_seed}")
+        log0(f"dense:{n_dense} bottleneck:{n_bottleneck} seed:{n_seed} k:{args.seed_num_bases} bn_rank:{args.bottleneck_rank} coeff_params:{n_coeff}")
         log0(f"layer_types:{base_model._layer_types}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1245,6 +1309,7 @@ def main() -> None:
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        wandb_log({"artifact_model_bytes": quant_file_bytes, "artifact_total_bytes": quant_file_bytes + code_bytes})
 
     if distributed:
         dist.barrier()
@@ -1276,7 +1341,7 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-    wandb_log({"final_val_loss": q_val_loss, "final_val_bpb": q_val_bpb, "artifact_bytes": quant_file_bytes if master_process else 0})
+    wandb_log({"final_val_loss": q_val_loss, "final_val_bpb": q_val_bpb})
     if master_process and args.wandb_enabled and wandb is not None and wandb.run is not None:
         wandb.finish()
 
