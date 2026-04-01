@@ -1082,6 +1082,14 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+
+    def cache_all_seed_weights() -> None:
+        """Refresh cached W for all SeedLinear layers after optimizer step."""
+        for module in base_model.modules():
+            if isinstance(module, SeedLinear):
+                module.cache_weight()
+
+    cache_all_seed_weights()
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1233,6 +1241,7 @@ def main() -> None:
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
+        cache_all_seed_weights()
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
@@ -1313,6 +1322,7 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        cache_all_seed_weights()
         zero_grad_all()
         if step_profiler:
             step_profiler.step_end()
