@@ -616,7 +616,13 @@ class SeedLinear(nn.Module):
         self.cache_weight()
 
     def cache_weight(self) -> None:
-        """Recompute W = einsum(coeffs, basis) and store for cached forward passes."""
+        """Materialize W = einsum(coeffs, basis) and store as a requires_grad leaf.
+
+        Forward uses F.linear(x, _cached_W) — fully compilable, no custom autograd.
+        After backward, _cached_W.grad holds the accumulated dL/dW across micro-steps.
+        Coefficient gradients are computed outside the compiled graph via
+        ``coeffs.grad = einsum("oi,koi->k", _cached_W.grad, basis)``.
+        """
         with torch.no_grad():
             W = torch.einsum(
                 "k,koi->oi",
@@ -624,15 +630,17 @@ class SeedLinear(nn.Module):
                 self.basis.to(torch.bfloat16),
             )
         if self._cached_W is not None and self._cached_W.shape == W.shape:
-            self._cached_W.copy_(W)
+            self._cached_W.data.copy_(W)
+            if self._cached_W.grad is not None:
+                self._cached_W.grad = None
         else:
-            self._cached_W = W
+            self._cached_W = W.requires_grad_(True)
 
     def forward(self, x: Tensor) -> Tensor:
         if self._cached_W is not None:
-            return _CachedSeedForward.apply(
-                x, self.coeffs.to(x.dtype), self.basis, self._cached_W.to(x.dtype),
-            )
+            # coeffs * 0 keeps DDP happy (param appears in graph) at zero cost.
+            # The real coeffs gradient is computed in transfer_seed_gradients().
+            return F.linear(x, self._cached_W.to(x.dtype)) + self.coeffs.sum() * 0
         W = torch.einsum("k,koi->oi", self.coeffs.to(x.dtype), self.basis.to(x.dtype))
         return F.linear(x, W)
 
@@ -1084,10 +1092,20 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
 
     def cache_all_seed_weights() -> None:
-        """Refresh cached W for all SeedLinear layers after optimizer step."""
+        """Materialize and cache W for all SeedLinear layers."""
         for module in base_model.modules():
             if isinstance(module, SeedLinear):
                 module.cache_weight()
+
+    def transfer_seed_gradients() -> None:
+        """Compute coeffs.grad from accumulated _cached_W.grad for all SeedLinear layers."""
+        for module in base_model.modules():
+            if isinstance(module, SeedLinear) and module._cached_W is not None:
+                gW = module._cached_W.grad
+                if gW is not None:
+                    module.coeffs.grad = torch.einsum(
+                        "oi,koi->k", gW, module.basis.to(gW.dtype),
+                    ).to(module.coeffs.dtype)
 
     cache_all_seed_weights()
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -1307,6 +1325,7 @@ def main() -> None:
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
+        transfer_seed_gradients()
         if step_profiler: step_profiler.mark_backward()
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
