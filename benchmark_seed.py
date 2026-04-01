@@ -243,6 +243,41 @@ def run_verify(dims: list[int], ks: list[int], device: str = "cuda") -> None:
                     print(f"    max abs diff: {(out_actual - out_ref).abs().max().item():.2e}")
 
     print()
+    print("--- Verifying cached forward correctness ---")
+    for d in dims:
+        for k in ks:
+            layer = SeedLinear(d, d, k).to(device)
+            x = torch.randn(2, 32, d, dtype=torch.bfloat16, device=device, requires_grad=True)
+
+            # Uncached forward + backward (reference)
+            layer._cached_W = None
+            out_ref = layer(x)
+            out_ref.sum().backward()
+            grad_coeffs_ref = layer.coeffs.grad.clone()
+            grad_x_ref = x.grad.clone()
+            layer.coeffs.grad = None
+            x.grad = None
+
+            # Cached forward + backward
+            layer.cache_weight()
+            out_cached = layer(x)
+            out_cached.sum().backward()
+            grad_coeffs_cached = layer.coeffs.grad.clone()
+            grad_x_cached = x.grad.clone()
+
+            fwd_diff = (out_ref - out_cached).abs().max().item()
+            gx_diff = (grad_x_ref - grad_x_cached).abs().max().item()
+            gc_diff = (grad_coeffs_ref - grad_coeffs_cached).abs().max().item()
+            gc_max = grad_coeffs_ref.abs().max().item()
+            gc_rel = gc_diff / gc_max if gc_max > 0 else gc_diff
+
+            ok = fwd_diff < 1e-5 and gx_diff < 1e-5 and gc_rel < 1e-2
+            status = "PASS" if ok else "FAIL"
+            print(f"  d={d:4d}  k={k:3d}  [{status}]  fwd={fwd_diff:.2e} gx={gx_diff:.2e} gc_rel={gc_rel:.2e}")
+            if not ok:
+                all_pass = False
+
+    print()
     if all_pass:
         print("All correctness checks passed.")
     else:
