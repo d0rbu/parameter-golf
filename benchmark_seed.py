@@ -258,10 +258,16 @@ def run_verify(dims: list[int], ks: list[int], device: str = "cuda") -> None:
             layer.coeffs.grad = None
             x.grad = None
 
-            # Cached forward + backward
+            # Cached forward + backward + manual gradient transfer
             layer.cache_weight()
             out_cached = layer(x)
             out_cached.sum().backward()
+            # Simulate transfer_seed_gradients(): compute coeffs.grad from _cached_W.grad
+            gW = layer._cached_W.grad
+            if gW is not None:
+                layer.coeffs.grad = torch.einsum(
+                    "oi,koi->k", gW, layer.basis.to(gW.dtype),
+                ).to(layer.coeffs.dtype)
             grad_coeffs_cached = layer.coeffs.grad.clone()
             grad_x_cached = x.grad.clone()
 
