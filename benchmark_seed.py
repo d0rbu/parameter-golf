@@ -47,6 +47,7 @@ def benchmark_layer(
 
     # Warmup
     for _ in range(warmup_iters):
+        layer.zero_grad(set_to_none=True)
         out = forward_fn(x)
         out.sum().backward()
 
@@ -54,6 +55,7 @@ def benchmark_layer(
 
     times_ms: list[float] = []
     for _ in range(num_iters):
+        layer.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         out = forward_fn(x)
@@ -233,6 +235,12 @@ def run_verify(dims: list[int], ks: list[int], device: str = "cuda") -> None:
             print(f"  d={d:4d}  k={k:3d}  [{status}]")
             if not match:
                 all_pass = False
+                # Print max diff for diagnosis
+                with torch.no_grad():
+                    out_actual = layer(x)
+                    W = torch.einsum("k,koi->oi", layer.coeffs.to(x.dtype), layer.basis.to(x.dtype))
+                    out_ref = F.linear(x, W)
+                    print(f"    max abs diff: {(out_actual - out_ref).abs().max().item():.2e}")
 
     print()
     if all_pass:
@@ -254,12 +262,10 @@ def _print_gpu_info() -> None:
     print()
 
 
-def _tflops(flops: int, elapsed_ms: float) -> float:
-    """Convert FLOPs + elapsed ms to TFLOPS (fwd+bwd ~ 3x fwd FLOPs)."""
-    # Forward + backward is approximately 3x forward FLOPs
-    total_flops = flops * 3
+def _tflops(fwd_flops: int, elapsed_ms: float) -> float:
+    """Forward TFLOPS (fwd FLOPs / total elapsed including backward)."""
     elapsed_s = elapsed_ms / 1e3
-    return (total_flops / 1e12) / elapsed_s if elapsed_s > 0 else 0.0
+    return (fwd_flops / 1e12) / elapsed_s if elapsed_s > 0 else 0.0
 
 
 def run_benchmarks(
@@ -354,7 +360,7 @@ def run_benchmarks(
     print("-" * len(header))
 
     for d in dims:
-        layer = CastedLinear(d, d).to(device)
+        layer = CastedLinear(d, d, bias=False).to(device)
         result = benchmark_layer(layer, (*input_shape, d), use_compile=use_compile)
         flops = calc_flops("casted", batch, seq, d, d)
         tflops = _tflops(flops, result["median_ms"])
