@@ -106,6 +106,10 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Profiling (enable with PROFILE=1).
+    profile_enabled = bool(int(os.environ.get("PROFILE", "0")))
+    profile_steps = int(os.environ.get("PROFILE_STEPS", "10"))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -533,6 +537,7 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+
 class SeedLinear(nn.Module):
     """Linear layer whose weight is a learned linear combination of deterministic random matrices.
 
@@ -557,6 +562,8 @@ class SeedLinear(nn.Module):
         # Basis matrices are regenerated from seeds -- NOT saved.
         self.register_buffer("basis", self._generate_basis(), persistent=False)
         self._init_coeffs(zero_init)
+        # Cached materialized weight (non-persistent, recomputed after optimizer step).
+        self.register_buffer("_cached_W", None, persistent=False)
 
     def _generate_basis(self) -> Tensor:
         sigma = 1.0 / math.sqrt(self.in_features * self.num_bases)
@@ -576,8 +583,34 @@ class SeedLinear(nn.Module):
     def regenerate_basis(self) -> None:
         """Rebuild basis matrices from seeds (call after load_state_dict)."""
         self.basis = self._generate_basis().to(self.coeffs.device)
+        self.cache_weight()
+
+    def cache_weight(self) -> None:
+        """Materialize W = einsum(coeffs, basis) and store as a requires_grad leaf.
+
+        Forward uses F.linear(x, _cached_W) — fully compilable, no custom autograd.
+        After backward, _cached_W.grad holds the accumulated dL/dW across micro-steps.
+        Coefficient gradients are computed outside the compiled graph via
+        ``coeffs.grad = einsum("oi,koi->k", _cached_W.grad, basis)``.
+        """
+        with torch.no_grad():
+            W = torch.einsum(
+                "k,koi->oi",
+                self.coeffs.to(torch.bfloat16),
+                self.basis.to(torch.bfloat16),
+            )
+        if self._cached_W is not None and self._cached_W.shape == W.shape:
+            self._cached_W.data.copy_(W)
+            if self._cached_W.grad is not None:
+                self._cached_W.grad = None
+        else:
+            self._cached_W = W.requires_grad_(True)
 
     def forward(self, x: Tensor) -> Tensor:
+        if self._cached_W is not None:
+            # coeffs * 0 keeps DDP happy (param appears in graph) at zero cost.
+            # The real coeffs gradient is computed in transfer_seed_gradients().
+            return F.linear(x, self._cached_W.to(x.dtype)) + self.coeffs.sum() * 0
         W = torch.einsum("k,koi->oi", self.coeffs.to(x.dtype), self.basis.to(x.dtype))
         return F.linear(x, W)
 
@@ -1027,6 +1060,24 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+
+    def cache_all_seed_weights() -> None:
+        """Materialize and cache W for all SeedLinear layers."""
+        for module in base_model.modules():
+            if isinstance(module, SeedLinear):
+                module.cache_weight()
+
+    def transfer_seed_gradients() -> None:
+        """Compute coeffs.grad from accumulated _cached_W.grad for all SeedLinear layers."""
+        for module in base_model.modules():
+            if isinstance(module, SeedLinear) and module._cached_W is not None:
+                gW = module._cached_W.grad
+                if gW is not None:
+                    module.coeffs.grad = torch.einsum(
+                        "oi,koi->k", gW, module.basis.to(gW.dtype),
+                    ).to(module.coeffs.dtype)
+
+    cache_all_seed_weights()
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1123,6 +1174,15 @@ def main() -> None:
         if master_process and args.wandb_enabled and wandb.run is not None:
             wandb.log(data, step=step)
 
+    # Profiling setup (PROFILE=1 to enable).
+    step_profiler = None
+    training_profiler = None
+    if args.profile_enabled and master_process:
+        from profiling import StepProfiler, TrainingProfiler
+        step_profiler = StepProfiler(device, warmup_steps=3)
+        training_profiler = TrainingProfiler(args.run_id, active_steps=args.profile_steps)
+        training_profiler.start()
+
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -1169,6 +1229,7 @@ def main() -> None:
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
+        cache_all_seed_weights()
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
@@ -1222,16 +1283,20 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
+        if step_profiler: step_profiler.step_begin()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            if step_profiler and micro_step == 0: step_profiler.mark_data()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
+        transfer_seed_gradients()
+        if step_profiler: step_profiler.mark_backward()
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1246,7 +1311,12 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        cache_all_seed_weights()
         zero_grad_all()
+        if step_profiler:
+            step_profiler.step_end()
+        if training_profiler:
+            training_profiler.step()
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1274,6 +1344,14 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    if step_profiler:
+        step_profiler.print_summary()
+    if training_profiler:
+        training_profiler.stop()
+        trace_path = f"logs/{args.run_id}_trace.json"
+        training_profiler.export_trace(trace_path)
+        training_profiler.print_kernel_summary()
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
