@@ -27,10 +27,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
+import wandb
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -44,7 +41,7 @@ except ImportError:
 class Hyperparameters:
     # Logging.
     wandb_project = os.environ.get("WANDB_PROJECT", "parameter-golf")
-    wandb_enabled = bool(int(os.environ.get("WANDB_ENABLED", "1" if wandb is not None else "0")))
+    wandb_enabled = bool(int(os.environ.get("WANDB_ENABLED", "1")))
 
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -1115,7 +1112,7 @@ def main() -> None:
     log0(f"seed:{args.seed}")
 
     # W&B logging (only on rank 0).
-    if master_process and args.wandb_enabled and wandb is not None:
+    if master_process and args.wandb_enabled:
         wandb.init(
             project=args.wandb_project,
             name=args.run_id,
@@ -1123,7 +1120,7 @@ def main() -> None:
         )
 
     def wandb_log(data: dict, step: int | None = None) -> None:
-        if master_process and args.wandb_enabled and wandb is not None and wandb.run is not None:
+        if master_process and args.wandb_enabled and wandb.run is not None:
             wandb.log(data, step=step)
 
     # -----------------------------
@@ -1342,7 +1339,7 @@ def main() -> None:
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     wandb_log({"final_val_loss": q_val_loss, "final_val_bpb": q_val_bpb})
-    if master_process and args.wandb_enabled and wandb is not None and wandb.run is not None:
+    if master_process and args.wandb_enabled and wandb.run is not None:
         wandb.finish()
 
     if distributed:
