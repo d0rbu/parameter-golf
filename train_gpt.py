@@ -101,6 +101,13 @@ class Hyperparameters:
     bottleneck_rank = int(os.environ.get("BOTTLENECK_RANK", 128))
     bottleneck_act = os.environ.get("BOTTLENECK_ACT", "relu2")
 
+    # Per-weight-type overrides within a block.  Comma-separated list of
+    # weight_name=type pairs.  Types: d(ense), b(ottleneck), s(eed).
+    # Weight names: q, k, v, o, fc, proj.  Only applies to dense/bottleneck
+    # layers (seed layers always use SeedLinear for everything).
+    # E.g. "q=b,k=b,v=b,o=b,fc=d,proj=d" makes attention bottleneck, MLP dense.
+    weight_types = os.environ.get("WEIGHT_TYPES", "")
+
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -713,10 +720,10 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
         make = linear_factory or (lambda in_f, out_f, **kw: CastedLinear(in_f, out_f, bias=False))
-        self.c_q = make(dim, dim)
-        self.c_k = make(dim, kv_dim)
-        self.c_v = make(dim, kv_dim)
-        self.proj = make(dim, dim, zero_init=True)
+        self.c_q = make(dim, dim, name="q")
+        self.c_k = make(dim, kv_dim, name="k")
+        self.c_v = make(dim, kv_dim, name="v")
+        self.proj = make(dim, dim, zero_init=True, name="o")
         if isinstance(self.proj, CastedLinear):
             self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
@@ -751,8 +758,8 @@ class MLP(nn.Module):
         super().__init__()
         hidden = mlp_mult * dim
         make = linear_factory or (lambda in_f, out_f, **kw: CastedLinear(in_f, out_f, bias=False))
-        self.fc = make(dim, hidden)
-        self.proj = make(hidden, dim, zero_init=True)
+        self.fc = make(dim, hidden, name="fc")
+        self.proj = make(hidden, dim, zero_init=True, name="proj")
         if isinstance(self.proj, CastedLinear):
             self.proj._zero_init = True
 
@@ -810,6 +817,7 @@ class GPT(nn.Module):
         layer_pattern: str = "",
         bottleneck_rank: int = 128,
         bottleneck_act: str = "relu2",
+        weight_types: str = "",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -834,32 +842,49 @@ class GPT(nn.Module):
             layer_types = ["dense"] * num_layers
             all_seeds = []
 
+        # Parse per-weight-type overrides: "q=b,k=b,fc=d" etc.
+        wt_overrides: dict[str, str] = {}
+        if weight_types:
+            for pair in weight_types.split(","):
+                wname, wtype = pair.strip().split("=")
+                wt_overrides[wname.strip()] = _LAYER_TYPE_ABBREV.get(wtype.strip(), wtype.strip())
+
         self._layer_types = layer_types
         seed_offset = 0
         blocks = []
         for i in range(num_layers):
             lt = layer_types[i]
             if lt == "seed":
+                # Seed layers: all weight matrices are SeedLinear, no per-weight override.
                 layer_seeds = all_seeds[seed_offset : seed_offset + 6 * seed_num_bases]
                 seed_offset += 6 * seed_num_bases
                 _matrix_idx = [0]
 
-                def make_seed_linear(in_f, out_f, zero_init=False, _seeds=layer_seeds, _k=seed_num_bases, _ctr=_matrix_idx):
+                def make_seed_linear(in_f, out_f, zero_init=False, name="", _seeds=layer_seeds, _k=seed_num_bases, _ctr=_matrix_idx):
                     start = _ctr[0] * _k
                     seeds_t = torch.tensor(_seeds[start : start + _k], dtype=torch.int64)
                     _ctr[0] += 1
                     return SeedLinear(in_f, out_f, _k, zero_init=zero_init, seeds=seeds_t)
 
                 factory = make_seed_linear
-            elif lt == "bottleneck":
-                _bn_rank, _bn_act = bottleneck_rank, bottleneck_act
+            else:
+                # Dense or bottleneck layers: support per-weight-type overrides.
+                _lt, _bn_rank, _bn_act, _wt = lt, bottleneck_rank, bottleneck_act, wt_overrides
 
-                def make_bottleneck_linear(in_f, out_f, zero_init=False, _r=_bn_rank, _a=_bn_act):
-                    return BottleneckLinear(in_f, out_f, _r, zero_init=zero_init, activation=_a)
+                def make_mixed_linear(in_f, out_f, zero_init=False, name="",
+                                      _default=_lt, _r=_bn_rank, _a=_bn_act, _overrides=_wt):
+                    effective = _overrides.get(name, _default)
+                    if effective == "bottleneck":
+                        return BottleneckLinear(in_f, out_f, _r, zero_init=zero_init, activation=_a)
+                    elif effective == "seed":
+                        raise ValueError(f"Cannot use seed type for weight '{name}' in a non-seed layer; use a seed layer instead")
+                    else:  # dense
+                        layer = CastedLinear(in_f, out_f, bias=False)
+                        if zero_init:
+                            layer._zero_init = True
+                        return layer
 
-                factory = make_bottleneck_linear
-            else:  # dense
-                factory = None
+                factory = make_mixed_linear
             blocks.append(
                 Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, linear_factory=factory)
             )
@@ -1022,6 +1047,7 @@ def main() -> None:
         layer_pattern=args.layer_pattern,
         bottleneck_rank=args.bottleneck_rank,
         bottleneck_act=args.bottleneck_act,
+        weight_types=args.weight_types,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):

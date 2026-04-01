@@ -103,6 +103,53 @@ Combining depth and width to fill the artifact budget.
 
 **Finding**: Deep models at d768 (20-25L) match but don't beat the baseline — the anchor layers eat too much budget. Deep + wide (20L d1024) improves quality but exceeds 16MB. This further motivates compressing anchor layers.
 
+## Experiment 6: BottleneckLinear and Per-Weight-Type Density Allocation
+
+Introduced `BottleneckLinear`: `y = A @ act(B @ x)` where A is (out, rank) and B is (rank, in). Tested as full layer replacement and as selective compression within dense anchor layers.
+
+### Full bottleneck layers fail at low rank
+
+Pure bottleneck models (no dense layers at all) performed very poorly. At d1536 with r=128 bottleneck anchors + seed layers, most configs failed to train (val_bpb > 4.0 = random). Only r=256+ showed signs of life (2.72 bpb). The bottleneck doesn't carry enough capacity as the sole non-seed layer type.
+
+### Activation function for bottleneck: linear is best
+
+| Activation | bpb | Notes |
+|-----------|-----|-------|
+| none (linear) | **2.524** | Best -- pure low-rank factorization |
+| relu | 2.566 | Slightly worse |
+| relu^2 | 3.426 | Much worse -- kills information in narrow bottleneck |
+
+The bottleneck functions as a low-rank factorization, not a nonlinear feature extractor.
+
+### Per-weight-type sensitivity (12L d1024, 1 dense anchor + 11 seed, r=128)
+
+Tested selectively bottlenecking different weight matrices within the dense anchor layer.
+
+| What's bottlenecked | bpb | Delta vs all-dense | Interpretation |
+|---------------------|-----|--------------------|----------------|
+| Nothing (all dense) | 2.377 | -- | Baseline |
+| **Q + K only** | **2.374** | **-0.003** (better!) | Q/K are inherently low-rank |
+| V + O | 2.633 | +0.256 | V/O are very sensitive |
+| All attention (Q/K/V/O) | 2.744 | +0.368 | V/O dominate the damage |
+| MLP (fc/proj) | 2.589 | +0.212 | MLP is moderately sensitive |
+| Everything | 2.966 | +0.589 | Catastrophic |
+
+**Q and K can be bottlenecked with zero quality loss.** They learn rotation subspaces for attention, which are inherently low-rank. V and O are the most sensitive -- they carry the actual information content. MLP weights fall in between.
+
+### Optimal density allocation strategy
+
+Based on all results:
+1. **Dense V, O, fc, proj** in anchor layers (these need full rank)
+2. **Bottleneck Q, K** at rank ~128 (saves ~30% per anchor, no quality loss)
+3. **Seed layers** for all non-anchor blocks (near-zero artifact cost)
+4. **First layer is always the anchor** (critical for quality)
+
+This strategy means each anchor layer at d1024 costs ~4.8MB instead of ~5.3MB. At d1536, a Q/K-bottlenecked anchor costs ~10MB instead of ~12.5MB.
+
+### Density sweep part 2 (in progress)
+
+Running Q/K bottleneck rank sweep (r=16 to r=256) and pushing wider (d1536, d2048) with Q/K-bottlenecked dense anchors. Results pending.
+
 ## Key Insights
 
 1. **Width >> Depth for quality**: Going from d512 to d1024 improves bpb by ~0.04. Adding 10 seed layers at d512 improves by ~0.00.
@@ -115,9 +162,13 @@ Combining depth and width to fill the artifact budget.
 
 5. **k is not a sensitive hyperparameter**: 16 to 128 all give similar results. Use whatever fits in VRAM.
 
+6. **Q/K projections are inherently low-rank**: Can be bottlenecked at r=128 with zero quality loss. V/O are very sensitive and need full density. MLP is intermediate.
+
+7. **Bottleneck activation should be linear**: The bottleneck works as a low-rank factorization, not a nonlinear module. relu^2 kills information.
+
 ## Next Steps
 
-1. **BottleneckLinear anchor compression**: Replace dense anchor layers with rank-128 bottlenecks to fit d1536+ under 16MB.
-2. **Per-weight-type optimization**: Test whether Q/K/V/O/fc/proj have different compressibility within a block.
+1. **Q/K bottleneck rank sweep**: Find minimum rank that preserves quality.
+2. **d1536+ with Q/K-bottlenecked anchors**: Use savings to fit wider models under 16MB.
 3. **Full training runs** (20K iterations on 8xH100) on the best configs.
 4. **Integration with SOTA techniques** (XSA, BigramHash, EMA, sliding window eval) after the core approach is validated.
