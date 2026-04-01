@@ -27,6 +27,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+import wandb
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -37,6 +39,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
+    # Logging.
+    wandb_project = os.environ.get("WANDB_PROJECT", "parameter-golf")
+    wandb_enabled = bool(int(os.environ.get("WANDB_ENABLED", "1")))
+
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -56,6 +62,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    grad_accum_override = int(os.environ.get("GRAD_ACCUM_STEPS", 0))  # 0 = use default (8 // world_size)
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -81,6 +88,19 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+
+    # Seed coefficient optimization.
+    seed_num_bases = int(os.environ.get("SEED_NUM_BASES", 0))  # k; 0 = disabled
+    seed_anchor_ratio = os.environ.get("SEED_ANCHOR_RATIO", "5:1")  # seed:anchor (legacy)
+    seed_coeff_lr = float(os.environ.get("SEED_COEFF_LR", 0.04))
+    seed_master_seed = int(os.environ.get("SEED_MASTER_SEED", 42))
+
+    # Layer pattern: repeating cycle of d(ense), b(ottleneck), s(eed).
+    # Overrides seed_anchor_ratio when set.  E.g. "d,s,s,s,s" or "d,b,s,s,s,s".
+    layer_pattern = os.environ.get("LAYER_PATTERN", "")
+    bottleneck_rank = int(os.environ.get("BOTTLENECK_RANK", 128))
+    bottleneck_act = os.environ.get("BOTTLENECK_ACT", "relu2")
+
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -513,6 +533,125 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+class SeedLinear(nn.Module):
+    """Linear layer whose weight is a learned linear combination of deterministic random matrices.
+
+    Only the scalar coefficients are trained. The random basis matrices are regenerated
+    from seeds at load time, so only coeffs + master_seed are stored in the artifact.
+    """
+
+    def __init__(self, in_features: int, out_features: int, num_bases: int,
+                 bias: bool = False, zero_init: bool = False, seeds: Tensor | None = None):
+        super().__init__()
+        if bias:
+            raise ValueError("SeedLinear does not support bias")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_bases = num_bases
+        # Learnable coefficients -- the ONLY trained parameters (kept in float32).
+        self.coeffs = nn.Parameter(torch.zeros(num_bases, dtype=torch.float32))
+        # Fixed seeds for each basis (persistent so they survive state_dict roundtrip).
+        if seeds is None:
+            seeds = torch.arange(num_bases, dtype=torch.int64)
+        self.register_buffer("seeds", seeds, persistent=True)
+        # Basis matrices are regenerated from seeds -- NOT saved.
+        self.register_buffer("basis", self._generate_basis(), persistent=False)
+        self._init_coeffs(zero_init)
+
+    def _generate_basis(self) -> Tensor:
+        sigma = 1.0 / math.sqrt(self.in_features * self.num_bases)
+        bases = []
+        for i in range(self.num_bases):
+            gen = torch.Generator()
+            gen.manual_seed(int(self.seeds[i].item()))
+            bases.append(torch.randn(self.out_features, self.in_features, generator=gen) * sigma)
+        return torch.stack(bases).to(torch.float8_e4m3fn)  # (k, out, in), fp8 to save VRAM
+
+    def _init_coeffs(self, zero_init: bool) -> None:
+        if zero_init:
+            nn.init.zeros_(self.coeffs)
+        else:
+            nn.init.ones_(self.coeffs)
+
+    def regenerate_basis(self) -> None:
+        """Rebuild basis matrices from seeds (call after load_state_dict)."""
+        self.basis = self._generate_basis().to(self.coeffs.device)
+
+    def forward(self, x: Tensor) -> Tensor:
+        W = torch.einsum("k,koi->oi", self.coeffs.to(x.dtype), self.basis.to(x.dtype))
+        return F.linear(x, W)
+
+
+class BottleneckLinear(nn.Module):
+    """Low-rank bottleneck linear layer: y = A @ act(B @ x).
+
+    Stores A (out_features, rank) and B (rank, in_features) instead of a full
+    (out_features, in_features) weight matrix.  With rank << min(in, out) this
+    gives large compression while the optional nonlinearity provides more
+    expressivity than a plain low-rank factorization.
+    """
+
+    _ACTIVATIONS = {
+        "relu2": lambda x: torch.relu(x).square(),
+        "relu": torch.relu,
+        "none": lambda x: x,
+    }
+
+    def __init__(self, in_features: int, out_features: int, rank: int,
+                 bias: bool = False, zero_init: bool = False, activation: str = "relu2"):
+        super().__init__()
+        if bias:
+            raise ValueError("BottleneckLinear does not support bias")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.act_fn = self._ACTIVATIONS[activation]
+        # B projects down: (rank, in_features). A projects up: (out_features, rank).
+        # Both are 2D -> will be optimized by Muon.
+        self.B = nn.Parameter(torch.empty(rank, in_features, dtype=torch.float32))
+        self.A = nn.Parameter(torch.empty(out_features, rank, dtype=torch.float32))
+        self._init_weights(zero_init)
+
+    def _init_weights(self, zero_init: bool) -> None:
+        # Kaiming init for B (fan_in = in_features).
+        nn.init.kaiming_normal_(self.B)
+        if zero_init:
+            nn.init.zeros_(self.A)
+        else:
+            nn.init.kaiming_normal_(self.A)
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = F.linear(x, self.B.to(x.dtype))
+        h = self.act_fn(h)
+        return F.linear(h, self.A.to(x.dtype))
+
+
+def derive_seed_schedule(master_seed: int, count: int) -> list[int]:
+    """Derive `count` deterministic seeds from a single master seed."""
+    gen = torch.Generator()
+    gen.manual_seed(master_seed)
+    return [int(torch.randint(0, 2**62, (1,), generator=gen).item()) for _ in range(count)]
+
+
+_LAYER_TYPE_ABBREV = {"d": "dense", "b": "bottleneck", "s": "seed"}
+
+
+def get_layer_types(num_layers: int, ratio_str: str = "", pattern_str: str = "") -> list[str]:
+    """Return a layer type for each layer index.
+
+    If *pattern_str* is given (e.g. ``"d,b,s,s,s"``), it is tiled to fill
+    *num_layers*.  Otherwise *ratio_str* (e.g. ``"5:1"``) is used as a
+    legacy seed:anchor ratio with anchor-first cycling.
+    """
+    if pattern_str:
+        cycle = [_LAYER_TYPE_ABBREV.get(t.strip(), t.strip()) for t in pattern_str.split(",")]
+        return [cycle[i % len(cycle)] for i in range(num_layers)]
+    parts = ratio_str.split(":")
+    n_seed, n_anchor = int(parts[0]), int(parts[1])
+    cycle = n_seed + n_anchor
+    return ["dense" if (i % cycle) < n_anchor else "seed" for i in range(num_layers)]
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -560,6 +699,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        linear_factory=None,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -572,11 +712,13 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
+        make = linear_factory or (lambda in_f, out_f, **kw: CastedLinear(in_f, out_f, bias=False))
+        self.c_q = make(dim, dim)
+        self.c_k = make(dim, kv_dim)
+        self.c_v = make(dim, kv_dim)
+        self.proj = make(dim, dim, zero_init=True)
+        if isinstance(self.proj, CastedLinear):
+            self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
@@ -605,12 +747,14 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, linear_factory=None):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        make = linear_factory or (lambda in_f, out_f, **kw: CastedLinear(in_f, out_f, bias=False))
+        self.fc = make(dim, hidden)
+        self.proj = make(hidden, dim, zero_init=True)
+        if isinstance(self.proj, CastedLinear):
+            self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
@@ -626,12 +770,13 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        linear_factory=None,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, linear_factory=linear_factory)
+        self.mlp = MLP(dim, mlp_mult, linear_factory=linear_factory)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -659,6 +804,12 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        seed_num_bases: int = 0,
+        seed_anchor_ratio: str = "5:1",
+        seed_master_seed: int = 42,
+        layer_pattern: str = "",
+        bottleneck_rank: int = 128,
+        bottleneck_act: str = "relu2",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,24 +817,54 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.seed_num_bases = seed_num_bases
+        self.seed_master_seed = seed_master_seed
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for i in range(num_layers)
-            ]
-        )
+
+        # Determine layer types: dense / bottleneck / seed.
+        if seed_num_bases > 0 or layer_pattern:
+            layer_types = get_layer_types(num_layers, ratio_str=seed_anchor_ratio, pattern_str=layer_pattern)
+            total_seed_matrices = sum(6 for lt in layer_types if lt == "seed")
+            all_seeds = derive_seed_schedule(seed_master_seed, total_seed_matrices * seed_num_bases) if total_seed_matrices > 0 else []
+        else:
+            layer_types = ["dense"] * num_layers
+            all_seeds = []
+
+        self._layer_types = layer_types
+        seed_offset = 0
+        blocks = []
+        for i in range(num_layers):
+            lt = layer_types[i]
+            if lt == "seed":
+                layer_seeds = all_seeds[seed_offset : seed_offset + 6 * seed_num_bases]
+                seed_offset += 6 * seed_num_bases
+                _matrix_idx = [0]
+
+                def make_seed_linear(in_f, out_f, zero_init=False, _seeds=layer_seeds, _k=seed_num_bases, _ctr=_matrix_idx):
+                    start = _ctr[0] * _k
+                    seeds_t = torch.tensor(_seeds[start : start + _k], dtype=torch.int64)
+                    _ctr[0] += 1
+                    return SeedLinear(in_f, out_f, _k, zero_init=zero_init, seeds=seeds_t)
+
+                factory = make_seed_linear
+            elif lt == "bottleneck":
+                _bn_rank, _bn_act = bottleneck_rank, bottleneck_act
+
+                def make_bottleneck_linear(in_f, out_f, zero_init=False, _r=_bn_rank, _a=_bn_act):
+                    return BottleneckLinear(in_f, out_f, _r, zero_init=zero_init, activation=_a)
+
+                factory = make_bottleneck_linear
+            else:  # dense
+                factory = None
+            blocks.append(
+                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, linear_factory=factory)
+            )
+        self.blocks = nn.ModuleList(blocks)
+
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -747,7 +928,7 @@ def main() -> None:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    grad_accum_steps = args.grad_accum_override if args.grad_accum_override > 0 else 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -835,6 +1016,12 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        seed_num_bases=args.seed_num_bases,
+        seed_anchor_ratio=args.seed_anchor_ratio,
+        seed_master_seed=args.seed_master_seed,
+        layer_pattern=args.layer_pattern,
+        bottleneck_rank=args.bottleneck_rank,
+        bottleneck_act=args.bottleneck_act,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -849,16 +1036,16 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    matrix_params = []
+    scalar_params = []
+    seed_coeff_params = []
+    for name, p in block_named_params:
+        if "coeffs" in name:
+            seed_coeff_params.append(p)
+        elif p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+            matrix_params.append(p)
+        else:
+            scalar_params.append(p)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -883,6 +1070,14 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if seed_coeff_params:
+        optimizer_seed = torch.optim.Adam(
+            [{"params": seed_coeff_params, "lr": args.seed_coeff_lr, "base_lr": args.seed_coeff_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_seed)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -894,6 +1089,13 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    if args.seed_num_bases > 0 or args.layer_pattern:
+        n_seed = sum(1 for lt in base_model._layer_types if lt == "seed")
+        n_dense = sum(1 for lt in base_model._layer_types if lt == "dense")
+        n_bottleneck = sum(1 for lt in base_model._layer_types if lt == "bottleneck")
+        n_coeff = sum(p.numel() for p in seed_coeff_params)
+        log0(f"dense:{n_dense} bottleneck:{n_bottleneck} seed:{n_seed} k:{args.seed_num_bases} bn_rank:{args.bottleneck_rank} coeff_params:{n_coeff}")
+        log0(f"layer_types:{base_model._layer_types}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -908,6 +1110,18 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+
+    # W&B logging (only on rank 0).
+    if master_process and args.wandb_enabled:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.run_id,
+            config={k: v for k, v in vars(type(args)).items() if not k.startswith("_") and not callable(v)},
+        )
+
+    def wandb_log(data: dict, step: int | None = None) -> None:
+        if master_process and args.wandb_enabled and wandb.run is not None:
+            wandb.log(data, step=step)
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -993,6 +1207,7 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            wandb_log({"val_loss": val_loss, "val_bpb": val_bpb}, step=step)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1044,6 +1259,7 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+        wandb_log({"train_loss": train_loss.item(), "lr_scale": scale}, step=step)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1090,6 +1306,7 @@ def main() -> None:
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        wandb_log({"artifact_model_bytes": quant_file_bytes, "artifact_total_bytes": quant_file_bytes + code_bytes})
 
     if distributed:
         dist.barrier()
@@ -1097,6 +1314,10 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    # Regenerate SeedLinear basis matrices from loaded seeds.
+    for module in base_model.modules():
+        if isinstance(module, SeedLinear):
+            module.regenerate_basis()
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1117,6 +1338,9 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    wandb_log({"final_val_loss": q_val_loss, "final_val_bpb": q_val_bpb})
+    if master_process and args.wandb_enabled and wandb.run is not None:
+        wandb.finish()
 
     if distributed:
         dist.destroy_process_group()
