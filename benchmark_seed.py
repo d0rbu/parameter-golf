@@ -291,7 +291,7 @@ def run_verify(dims: list[int], ks: list[int], device: str = "cuda") -> None:
 def _print_gpu_info() -> None:
     """Print GPU name and peak specs."""
     name = torch.cuda.get_device_name(0)
-    mem_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
+    mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     print(f"GPU: {name}  ({mem_gb:.1f} GB)")
     print(f"Reference peaks (RTX 4090): {RTX4090_MEM_BW_GBS} GB/s mem BW, {RTX4090_BF16_TFLOPS} TFLOPS bf16")
     print()
