@@ -106,6 +106,10 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Profiling (enable with PROFILE=1).
+    profile_enabled = bool(int(os.environ.get("PROFILE", "0")))
+    profile_steps = int(os.environ.get("PROFILE_STEPS", "10"))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -1123,6 +1127,15 @@ def main() -> None:
         if master_process and args.wandb_enabled and wandb.run is not None:
             wandb.log(data, step=step)
 
+    # Profiling setup (PROFILE=1 to enable).
+    step_profiler = None
+    training_profiler = None
+    if args.profile_enabled and master_process:
+        from profiling import StepProfiler, TrainingProfiler
+        step_profiler = StepProfiler(device, warmup_steps=3)
+        training_profiler = TrainingProfiler(args.run_id, active_steps=args.profile_steps)
+        training_profiler.start()
+
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -1222,16 +1235,19 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
+        if step_profiler: step_profiler.step_begin()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            if step_profiler and micro_step == 0: step_profiler.mark_data()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
+        if step_profiler: step_profiler.mark_backward()
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1247,6 +1263,10 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+        if step_profiler:
+            step_profiler.step_end()
+        if training_profiler:
+            training_profiler.step()
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1274,6 +1294,14 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    if step_profiler:
+        step_profiler.print_summary()
+    if training_profiler:
+        training_profiler.stop()
+        trace_path = f"logs/{args.run_id}_trace.json"
+        training_profiler.export_trace(trace_path)
+        training_profiler.print_kernel_summary()
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
