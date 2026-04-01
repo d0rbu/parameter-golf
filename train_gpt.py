@@ -537,36 +537,6 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
-class _CachedSeedForward(torch.autograd.Function):
-    """Custom autograd for SeedLinear with cached weight matrix.
-
-    Forward: uses pre-computed cached_W (skips einsum), saving bandwidth.
-    Backward: computes dL/d_coeffs from basis and grad_W.
-    Uses setup_context for torch.compile compatibility.
-    """
-
-    @staticmethod
-    def forward(x: Tensor, coeffs: Tensor, basis: Tensor, cached_W: Tensor) -> Tensor:
-        return F.linear(x, cached_W)
-
-    @staticmethod
-    def setup_context(ctx, inputs, output):
-        x, coeffs, basis, cached_W = inputs
-        ctx.save_for_backward(x, cached_W, basis)
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor):
-        x, cached_W, basis = ctx.saved_tensors
-        # dL/dx = grad_output @ W
-        grad_x = grad_output @ cached_W
-        # dL/dW = grad_output^T @ x (flattened to 2D)
-        x_2d = x.reshape(-1, x.shape[-1])
-        go_2d = grad_output.reshape(-1, grad_output.shape[-1])
-        grad_W = go_2d.t() @ x_2d
-        # dL/d_coeffs[k] = sum_{o,i} dL/dW[o,i] * basis[k,o,i]
-        grad_coeffs = torch.einsum("oi,koi->k", grad_W, basis.to(grad_W.dtype))
-        return grad_x, grad_coeffs, None, None
-
 
 class SeedLinear(nn.Module):
     """Linear layer whose weight is a learned linear combination of deterministic random matrices.
