@@ -12,3 +12,7 @@ logs/
 pyproject.toml
 uv.lock
 .python-version
+wandb/
+final_model.pt
+final_model.int8.ptz
+*.ptz
